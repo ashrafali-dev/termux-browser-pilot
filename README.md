@@ -817,6 +817,44 @@ termux-browser-pilot/
 - Chromium mode: `chromium`, `xorg-server-xvfb`, `mesa`, `python3`, `websockets>=12.0`
 - `openbox` (lightweight WM) is required for reliable keyboard shortcut routing in Xvfb
 
+## Troubleshooting
+
+### SSL Certificate Errors (Firefox)
+
+If Firefox shows "Warning: Potential Security Risk Ahead" on HTTPS sites, it means
+Firefox isn't using Termux's system CA certificates. The daemon automatically fixes
+this on startup (v0.17.2+), but if you're on an older version or have an existing
+profile, add this to `~/.tbp/firefox_profile/user.js`:
+
+```javascript
+user_pref("security.enterprise_roots.enabled", true);
+```
+
+Then restart the daemon:
+
+```bash
+tbp stop
+tbp goto https://example.com   # auto-starts with fix applied
+```
+
+Make sure the `ca-certificates` package is installed:
+
+```bash
+pkg install ca-certificates
+```
+
+### Daemon Won't Start
+
+If the daemon fails to start, check the log:
+
+```bash
+cat ~/.tbp/daemon.log
+```
+
+Common fixes:
+- Kill stale processes: `pkill -f Xvfb; pkill -f firefox; rm ~/.tbp/daemon.pid ~/.tbp/daemon.sock`
+- Ensure Xvfb is installed: `pkg install xorg-server-xvfb`
+
 ## License
 
 MIT

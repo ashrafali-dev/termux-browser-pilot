@@ -9,7 +9,7 @@ pkg install -y x11-repo tur-repo 2>/dev/null || true
 
 # Core dependencies (Firefox mode - default, passes Cloudflare)
 echo "[1/4] Installing Firefox + Xvfb + tools..."
-pkg install -y firefox xorg-server-xvfb xdotool xclip openbox imagemagick python3 2>/dev/null
+pkg install -y firefox xorg-server-xvfb xdotool xclip openbox imagemagick python3 ca-certificates 2>/dev/null
 
 # Optional: Chromium mode (for CDP/network tracking)
 echo "[2/4] Installing Chromium (optional)..."

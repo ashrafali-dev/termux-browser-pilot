@@ -56,6 +56,17 @@ class Daemon:
 
         # Start browser with persistent Firefox profile
         os.makedirs(FIREFOX_PROFILE_DIR, mode=0o700, exist_ok=True)
+        # Ensure Firefox uses system CA certificates (fixes SSL errors on Termux)
+        _user_js = os.path.join(FIREFOX_PROFILE_DIR, "user.js")
+        _cert_pref = 'user_pref("security.enterprise_roots.enabled", true);'
+        if os.path.exists(_user_js):
+            _existing = open(_user_js).read()
+            if "enterprise_roots" not in _existing:
+                with open(_user_js, "a") as f:
+                    f.write("\n" + _cert_pref + "\n")
+        else:
+            with open(_user_js, "w") as f:
+                f.write(_cert_pref + "\n")
         from .pilot import Pilot
         self.pilot = Pilot(
             browser=self._browser_type,
