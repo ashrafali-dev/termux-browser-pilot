@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "termux-browser-pilot"
+version = "0.1.0a1"
+description = "Real browser automation for Termux/Android. Firefox passes Cloudflare natively."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    {name = "Termux Browser Pilot Contributors"},
+]
+keywords = ["browser", "automation", "termux", "android", "firefox", "cloudflare"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.optional-dependencies]
+chromium = ["websockets>=12.0"]
+mcp = ["mcp[cli]>=1.0"]
+
+[project.scripts]
+tbp = "cli:main"
+tbp-mcp = "src.mcp_server:main"
+
+[project.urls]
+Homepage = "https://github.com/salviz/termux-browser-pilot"
+
+[tool.setuptools]
+py-modules = ["cli"]
+
+[tool.setuptools.packages.find]
+include = ["src*"]
