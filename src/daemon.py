@@ -2421,13 +2421,14 @@ async def _inject_search(daemon):
 # ── Shadow DOM access ──────────────────────────────────
 
 _SHADOW_DEEP_QUERY_JS = (
-    "function __tbp_dq(root,sel){"
+    "function __tbp_dq(root,sel,d){"
+    "if(d===undefined)d=5;if(d<=0)return null;"
     "var el=root.querySelector(sel);if(el)return el;"
-    "var all=root.querySelectorAll('*');"
+    "var all=root.getElementsByTagName('*');"
     "for(var i=0;i<all.length;i++){"
     "if(all[i].shadowRoot){"
-    "var found=__tbp_dq(all[i].shadowRoot,sel);"
-    "if(found)return found}}return null}"
+    "var f=__tbp_dq(all[i].shadowRoot,sel,d-1);"
+    "if(f)return f}}return null}"
 )
 
 
