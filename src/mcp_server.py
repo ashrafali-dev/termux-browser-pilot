@@ -310,19 +310,58 @@ async def browser_hover(target: str = "", x: int = None,
     return _result(await _send("hover", params))
 
 
+@mcp.tool()
+async def browser_mouse_move(x: int = 0, y: int = 0,
+                             path: str = "") -> dict:
+    """Move mouse to coordinates and take screenshot with cursor crosshair.
+
+    REQUIRED before browser_click(x, y). Arms the click at these coordinates.
+    Returns screenshot with red crosshair showing where the cursor is.
+    Verify the position visually, then call browser_click with same x, y.
+
+    Args:
+        x: X coordinate to move mouse to.
+        y: Y coordinate to move mouse to.
+        path: Optional screenshot path (default: cursor_preview.png).
+    """
+    params = {"x": x, "y": y}
+    if path:
+        params["path"] = path
+    return _result(await _send("mouse_move", params))
+
+
+@mcp.tool()
+async def browser_mouse_locate(path: str = "") -> dict:
+    """Get current mouse position and take screenshot with cursor crosshair.
+
+    Arms browser_click at the current cursor coordinates.
+    Use when you don't know exact coordinates but want to see where
+    the cursor is and click at that position.
+
+    Args:
+        path: Optional screenshot path (default: cursor_preview.png).
+    """
+    params = {}
+    if path:
+        params["path"] = path
+    return _result(await _send("mouse_locate", params))
+
+
 # ── Screenshots ──────────────────────────────────
 
 @mcp.tool()
 async def browser_screenshot(path: str = "screenshot.png",
-                             full_page: bool = False) -> dict:
+                             full_page: bool = False,
+                             cursor: bool = False) -> dict:
     """Take a screenshot of the current page.
 
     Args:
         path: File path to save the PNG screenshot.
         full_page: If True, capture the entire scrollable page.
+        cursor: If True, draw a red crosshair at the last mouse_move position.
     """
     return _result(await _send("screenshot", {
-        "path": path, "full": full_page,
+        "path": path, "full": full_page, "cursor": cursor,
     }))
 
 

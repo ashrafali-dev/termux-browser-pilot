@@ -27,6 +27,25 @@ DOWNLOAD_DIR = os.path.join(TBP_DIR, "downloads")
 FIREFOX_PROFILE_DIR = os.path.join(TBP_DIR, "firefox_profile")
 
 
+def _draw_cursor_overlay(path, cx, cy):
+    """Draw a red crosshair + circle at (cx, cy) on a screenshot PNG."""
+    try:
+        from PIL import Image, ImageDraw
+        img = Image.open(path)
+        draw = ImageDraw.Draw(img)
+        r = 12  # crosshair radius
+        color = (255, 0, 0, 255)
+        # Crosshair lines
+        draw.line([(cx - r, cy), (cx + r, cy)], fill=color, width=2)
+        draw.line([(cx, cy - r), (cx, cy + r)], fill=color, width=2)
+        # Circle
+        draw.ellipse([(cx - r, cy - r), (cx + r, cy + r)],
+                     outline=color, width=2)
+        img.save(path)
+    except ImportError:
+        pass  # PIL not available — skip overlay
+
+
 class Daemon:
     """Background daemon managing browser and socket server."""
 
@@ -43,6 +62,7 @@ class Daemon:
         self._shutting_down = False
         self._cmd_lock = None  # Initialized in run() within event loop
         self._main_wid = None  # Main browser window ID (set after start)
+        self._cursor_pos = None  # Last mouse_move position (x, y)
 
     async def run(self):
         """Main daemon entry point."""
@@ -354,36 +374,51 @@ async def _handle_click(daemon, params):
     count = params.get("count", 1)
     interval = params.get("interval", 0.1)
 
-    # When clicking by coordinates on a popup window (not main), use xdotool
-    # because CDP Input.dispatchMouseEvent targets the main page, not popups
-    use_xdotool = False
-    if x is not None and y is not None and not target:
-        try:
-            session = daemon.pilot._session
-            env = {**os.environ, "DISPLAY": session._display}
-            proc = await asyncio.create_subprocess_exec(
-                "xdotool", "getactivewindow",
-                env=env, stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+    # For raw coordinate clicks (no selector), require prior mouse_move
+    # or mouse_locate to the same coordinates. This prevents blind clicks.
+    use_xdotool = x is not None and y is not None and not target
+
+    if use_xdotool:
+        ix, iy = int(x), int(y)
+        armed = daemon._cursor_pos
+        if armed is None or armed != (ix, iy):
+            armed_str = f"{armed[0]},{armed[1]}" if armed else "none"
+            raise ValueError(
+                f"Click at ({ix},{iy}) rejected — cursor armed at ({armed_str}). "
+                f"Call browser_mouse_move({ix},{iy}) or browser_mouse_locate() first, "
+                f"then verify the screenshot before clicking."
             )
-            out, _ = await proc.communicate()
-            active_wid = out.decode().strip()
-            if active_wid and active_wid != daemon._main_wid:
-                use_xdotool = True
-        except Exception:
-            pass
 
     try:
         if use_xdotool:
             session = daemon.pilot._session
             btn_map = {"left": "1", "middle": "2", "right": "3"}
             btn_num = btn_map.get(button, "1")
-            await session._xdt(["mousemove", "--window",
-                                active_wid, str(x), str(y)])
-            await asyncio.sleep(0.1)
+            # Console already closed by mouse_move/locate — just click
+            # Check if active window is a popup (not main browser)
+            popup_wid = None
+            try:
+                env = {**os.environ, "DISPLAY": session._display}
+                proc = await asyncio.create_subprocess_exec(
+                    "xdotool", "getactivewindow",
+                    env=env, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                out, _ = await proc.communicate()
+                active_wid = out.decode().strip()
+                if active_wid and active_wid != daemon._main_wid:
+                    popup_wid = active_wid
+            except Exception:
+                pass
+            click_args = ["click"]
+            if popup_wid:
+                click_args += ["--window", popup_wid]
+            click_args.append(btn_num)
             for _ in range(count):
-                await session._xdt(["click", "--window", active_wid, btn_num])
+                await session._xdt(click_args)
                 await asyncio.sleep(interval)
+            # Reset armed position after click (must re-arm for next click)
+            daemon._cursor_pos = None
         elif human:
             await daemon.pilot.human_click(selector=target, x=x, y=y)
         else:
@@ -496,6 +531,74 @@ async def _handle_hover(daemon, params):
     return result
 
 
+async def _mouse_screenshot(daemon, cx, cy, path=None):
+    """Take screenshot with cursor crosshair at (cx, cy). Returns path."""
+    from ._utils import validate_path
+    if not path:
+        path = validate_path("cursor_preview.png")
+    else:
+        path = validate_path(path)
+    try:
+        await daemon.pilot._session._dismiss_popup()
+    except Exception:
+        pass
+    await daemon.pilot.screenshot(path, full_page=False)
+    _draw_cursor_overlay(path, cx, cy)
+    return path
+
+
+async def _handle_mouse_move(daemon, params):
+    x = params.get("x")
+    y = params.get("y")
+    if x is None or y is None:
+        raise ValueError("Missing x/y coordinates")
+    session = daemon.pilot._session
+    # Close console so mouse lands on page, not DevTools
+    try:
+        await session._close_console()
+    except Exception:
+        pass
+    await asyncio.sleep(0.15)
+    # Screenshots are full-screen captures (include browser chrome),
+    # so image coordinates ARE screen coordinates — no conversion needed.
+    ix, iy = int(x), int(y)
+    await session._xdt(["mousemove", str(ix), str(iy)])
+    daemon._cursor_pos = (ix, iy)
+    # Auto-screenshot with cursor overlay
+    path = await _mouse_screenshot(daemon, ix, iy, params.get("path"))
+    return {"moved_to": {"x": ix, "y": iy}, "screenshot": path}
+
+
+async def _handle_mouse_locate(daemon, params):
+    session = daemon.pilot._session
+    # Close console so we read actual page mouse position
+    try:
+        await session._close_console()
+    except Exception:
+        pass
+    await asyncio.sleep(0.15)
+    # Get current mouse position via xdotool (screen coords = image coords)
+    env = {**os.environ, "DISPLAY": session._display}
+    proc = await asyncio.create_subprocess_exec(
+        "xdotool", "getmouselocation",
+        env=env, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, _ = await proc.communicate()
+    # Parse "x:123 y:456 screen:0 window:789"
+    parts = out.decode().strip().split()
+    mx = my = 0
+    for p in parts:
+        if p.startswith("x:"):
+            mx = int(p[2:])
+        elif p.startswith("y:"):
+            my = int(p[2:])
+    daemon._cursor_pos = (mx, my)
+    # Auto-screenshot with cursor overlay
+    path = await _mouse_screenshot(daemon, mx, my, params.get("path"))
+    return {"position": {"x": mx, "y": my}, "screenshot": path}
+
+
 async def _handle_text(daemon, params):
     selector = params.get("selector")
     limit = params.get("limit")
@@ -544,13 +647,20 @@ async def _handle_screenshot(daemon, params):
     from ._utils import validate_path
     path = validate_path(params.get("path", "screenshot.png"))
     full = params.get("full", False)
+    cursor = params.get("cursor", False)
     # Dismiss Firefox chrome popups (save password/address) for clean screenshot
     try:
         await daemon.pilot._session._dismiss_popup()
     except Exception:
         pass
     await daemon.pilot.screenshot(path, full_page=full)
-    return {"path": path}
+    # Draw cursor crosshair overlay if requested and position is known
+    if cursor and daemon._cursor_pos:
+        _draw_cursor_overlay(path, daemon._cursor_pos[0], daemon._cursor_pos[1])
+    result = {"path": path}
+    if daemon._cursor_pos:
+        result["cursor"] = {"x": daemon._cursor_pos[0], "y": daemon._cursor_pos[1]}
+    return result
 
 
 async def _handle_pdf(daemon, params):
@@ -1546,7 +1656,7 @@ async def _handle_iframe_click(daemon, params):
     # Click at center of iframe, or at x/y offset from iframe top-left
     click_x = rect["x"] + (x_offset if x_offset else rect["w"] // 2)
     click_y = rect["y"] + (y_offset if y_offset else rect["h"] // 2)
-    session = daemon.pilot.session
+    session = daemon.pilot._session
     await session._close_console()
     await asyncio.sleep(0.1)
     await session._xdt(["mousemove", "--sync", str(click_x), str(click_y)])
@@ -4810,6 +4920,8 @@ _HANDLERS = {
     "press": _handle_press,
     "scroll": _handle_scroll,
     "hover": _handle_hover,
+    "mouse_move": _handle_mouse_move,
+    "mouse_locate": _handle_mouse_locate,
     "text": _handle_text,
     "html": _handle_html,
     "title": _handle_title,
