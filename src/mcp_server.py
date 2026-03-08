@@ -804,15 +804,23 @@ async def browser_iframe_text(selector: str,
 
 
 @mcp.tool()
-async def browser_iframe_click(selector: str, target: str) -> dict:
+async def browser_iframe_click(selector: str, target: str,
+                               x: int = 0, y: int = 0) -> dict:
     """Click an element inside an iframe.
+
+    For same-origin iframes, clicks by CSS selector inside the iframe.
+    For cross-origin iframes, falls back to coordinate click within
+    the iframe bounds. Use x/y offsets from iframe top-left corner
+    to target specific elements in cross-origin iframes.
 
     Args:
         selector: CSS selector of the iframe element.
         target: CSS selector of the element to click inside the iframe.
+        x: X offset from iframe top-left for cross-origin fallback.
+        y: Y offset from iframe top-left for cross-origin fallback.
     """
     return _result(await _send("iframe_click", {
-        "selector": selector, "target": target,
+        "selector": selector, "target": target, "x": x, "y": y,
     }))
 
 

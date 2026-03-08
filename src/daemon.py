@@ -1501,9 +1501,17 @@ async def _handle_iframe_text(daemon, params):
 
 
 async def _handle_iframe_click(daemon, params):
-    """Click an element inside an iframe."""
+    """Click an element inside an iframe.
+
+    For same-origin iframes, uses contentDocument.querySelector.
+    For cross-origin iframes, falls back to coordinate-based click
+    at the center of the iframe (use x/y offsets to target specific
+    elements within the iframe).
+    """
     selector = params.get("selector")
     target = params.get("target")
+    x_offset = params.get("x", 0) or 0
+    y_offset = params.get("y", 0) or 0
     if not selector:
         raise ValueError("Missing 'selector' parameter (iframe CSS selector)")
     if not target:
@@ -1511,14 +1519,41 @@ async def _handle_iframe_click(daemon, params):
     from ._utils import escape_js_string
     safe_sel = escape_js_string(selector)
     safe_target = escape_js_string(target)
-    await daemon.pilot.evaluate(
+    # Try same-origin first
+    try:
+        result = await daemon.pilot.evaluate(
+            f"(function(){{var f=document.querySelector('{safe_sel}');"
+            "if(!f)throw new Error('Iframe not found');"
+            "try{if(!f.contentDocument)throw new Error('x')}catch(e){"
+            "throw new Error('Cross-origin iframe')};"
+            f"var el=f.contentDocument.querySelector('{safe_target}');"
+            "if(!el)throw new Error('Element not found in iframe');"
+            "el.click();return 'ok'})()"
+        )
+        return {"clicked": target, "iframe": selector, "method": "contentDocument"}
+    except Exception:
+        pass
+    # Cross-origin fallback: get iframe bounding rect and click by coordinates
+    rect = await daemon.pilot.evaluate(
         f"(function(){{var f=document.querySelector('{safe_sel}');"
-        "if(!f||!f.contentDocument)throw new Error('Iframe not accessible');"
-        f"var el=f.contentDocument.querySelector('{safe_target}');"
-        "if(!el)throw new Error('Element not found in iframe');"
-        "el.click()})()"
+        "if(!f)return null;"
+        "var r=f.getBoundingClientRect();"
+        "return {x:Math.round(r.x),y:Math.round(r.y),"
+        "w:Math.round(r.width),h:Math.round(r.height)}})()"
     )
-    return {"clicked": target, "iframe": selector}
+    if not rect:
+        raise ValueError(f"Iframe not found: {selector}")
+    # Click at center of iframe, or at x/y offset from iframe top-left
+    click_x = rect["x"] + (x_offset if x_offset else rect["w"] // 2)
+    click_y = rect["y"] + (y_offset if y_offset else rect["h"] // 2)
+    session = daemon.pilot.session
+    await session._close_console()
+    await asyncio.sleep(0.1)
+    await session._xdt(["mousemove", "--sync", str(click_x), str(click_y)])
+    await asyncio.sleep(0.05)
+    await session._xdt(["click", "1"])
+    return {"clicked": target, "iframe": selector, "method": "coordinate",
+            "x": click_x, "y": click_y}
 
 
 # ── File upload ──────────────────────────────────
