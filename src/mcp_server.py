@@ -167,6 +167,28 @@ async def browser_find(text: str, role: str = "",
     return _result(await _send("find", params))
 
 
+@mcp.tool()
+async def browser_elements(kind: str, limit: int = 50) -> dict:
+    """List interactive page elements by kind.
+
+    Returns elements with CSS selectors ready for clicking/typing.
+
+    Kinds:
+      links — anchor elements: text, href, selector
+      buttons — buttons and submit inputs: text, type, selector, disabled
+      inputs — text inputs, textareas, selects (not hidden/submit): type, name, placeholder, value, selector, label
+      forms — form elements: action, method, id, fields list
+      headings — h1-h6: level, text, selector
+      selects — dropdowns and comboboxes: selector, name, options, multiple
+      images — img elements: src, alt, width, height, selector
+
+    Args:
+        kind: Element kind — one of: links, buttons, inputs, forms, headings, selects, images.
+        limit: Max elements to return (default 50).
+    """
+    return _result(await _send("elements", {"kind": kind, "limit": limit}))
+
+
 # ── Interaction ──────────────────────────────────
 
 @mcp.tool()

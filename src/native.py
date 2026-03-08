@@ -110,6 +110,8 @@ class NativeFirefoxSession:
         self._console_open = False
         self._console_synced = False  # True after first exec syncs console state
         self._page_has_focus = False  # True after mouse click on page
+        self._devtools_wid = None  # DevTools window ID (separate window mode)
+        self._main_wid = None  # Main browser window ID
         self._viewport_offset = None
         self._viewport_offset_cache = None
         self._viewport_offset_cache_time = 0.0
@@ -174,6 +176,9 @@ class NativeFirefoxSession:
                 # Disable console autocomplete (avoids corruption when typing JS)
                 "devtools.editor.autoclosebrackets": "false",
                 "devtools.webconsole.input.autocomplete": "false",
+                # DevTools in separate window — prevents viewport resize and
+                # focus stealing when console opens/closes (fixes dropdown bugs)
+                "devtools.toolbox.host": '"window"',
                 # Auto-download (no save-as dialog)
                 "browser.download.folderList": "2",
                 "browser.download.useDownloadDir": "true",
@@ -279,8 +284,11 @@ class NativeFirefoxSession:
         if self._firefox_proc.returncode is not None:
             raise RuntimeError("Firefox failed to start")
 
-        logger.info("Native Firefox started (pid %d), callback port %d",
-                     self._firefox_proc.pid, self._callback_port)
+        # Discover the main browser window ID for window management
+        await self._find_main_window()
+
+        logger.info("Native Firefox started (pid %d), callback port %d, main_wid=%s",
+                     self._firefox_proc.pid, self._callback_port, self._main_wid)
         return self
 
     async def _xdt(self, args, timeout=10):
@@ -413,18 +421,31 @@ class NativeFirefoxSession:
 
         # Open console if not already open (Ctrl+Shift+K toggle)
         if not self._console_open:
+            # Focus main window first so Ctrl+Shift+K opens from browser
+            await self._focus_main_window()
             await self._xdt(["key", "ctrl+shift+k"])
             await asyncio.sleep(1.0)
             self._console_open = True
-            self._viewport_offset_cache = None  # Console changed viewport
+            # In separate-window mode, find and track the DevTools window
+            if not self._devtools_wid:
+                await self._find_devtools_window()
+            self._viewport_offset_cache = None
         elif self._page_has_focus:
-            # Console is open but page element has focus (after mouse click).
-            # Toggle console off then on to refocus the console input.
-            await self._xdt(["key", "ctrl+shift+k"])
-            await asyncio.sleep(0.3)
-            await self._xdt(["key", "ctrl+shift+k"])
-            await asyncio.sleep(0.5)
+            # Console is open but page has focus (after mouse click).
+            # Focus main window first so console targets the right context.
+            await self._focus_main_window()
+            if self._devtools_wid:
+                await self._ensure_devtools_focused()
+            else:
+                # Legacy docked mode: toggle console off then on to refocus
+                await self._xdt(["key", "ctrl+shift+k"])
+                await asyncio.sleep(0.3)
+                await self._xdt(["key", "ctrl+shift+k"])
+                await asyncio.sleep(0.5)
             self._page_has_focus = False
+        elif self._devtools_wid:
+            # Console open in separate window — ensure it's focused
+            await self._ensure_devtools_focused()
 
         # Clear existing text and paste
         await self._xdt(["key", "ctrl+a"])
@@ -488,35 +509,37 @@ class NativeFirefoxSession:
     async def _clipboard_paste(self, text):
         """Write text to clipboard and paste into focused field.
 
-        Uses xclip -loops 1 to keep clipboard ownership alive until
-        exactly one paste operation (Ctrl+V) completes. This is more
-        reliable than xdotool type for long strings with special chars.
+        Uses xclip without -loops (stays as clipboard owner) so that
+        intermediate clipboard reads (from WM or DevTools) don't consume
+        the content before Ctrl+V can paste it. Killed after paste.
         """
         env = os.environ.copy()
         env["DISPLAY"] = self._display
         try:
             proc = await asyncio.create_subprocess_exec(
-                "xclip", "-selection", "clipboard", "-loops", "1",
+                "xclip", "-selection", "clipboard",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
                 env=env,
             )
-            # Use communicate() to safely write (avoids pipe buffer deadlock)
-            comm_task = asyncio.create_task(
-                proc.communicate(input=text.encode("utf-8"))
-            )
-            await asyncio.sleep(0.2)
+            proc.stdin.write(text.encode("utf-8"))
+            proc.stdin.close()
+            await asyncio.sleep(0.3)
 
             await self._xdt(["key", "ctrl+v"])
             await asyncio.sleep(0.5)
 
+            # Kill xclip now that paste is done (release clipboard ownership)
             try:
-                await asyncio.wait_for(proc.wait(), timeout=3)
-            except asyncio.TimeoutError:
-                comm_task.cancel()
-                proc.kill()
-                await proc.wait()
+                proc.terminate()
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
             return True
         except Exception as e:
             logger.debug("Clipboard paste failed: %s", e)
@@ -532,16 +555,130 @@ class NativeFirefoxSession:
         await asyncio.sleep(0.15)
 
     async def _close_console(self):
-        """Close DevTools via Ctrl+Shift+I (toggles entire DevTools).
+        """Hide DevTools and refocus the main browser window.
 
-        Ctrl+Shift+K only toggles console panel and doesn't work
-        reliably for closing. Ctrl+Shift+I toggles all of DevTools.
+        In separate-window mode: minimizes DevTools window (no viewport change).
+        Console stays logically "open" — just not visible.
+        Fallback: Ctrl+Shift+I toggle (legacy docked mode).
         """
-        if self._console_open:
+        if not self._console_open:
+            return
+        if self._devtools_wid:
+            # Separate window mode — minimize + focus main (no viewport change)
+            await self._hide_devtools()
+            # Console is still open in the minimized window — don't set False
+            # so _run_js_and_read can reuse it without reopening
+        else:
+            # Legacy docked mode fallback
             await self._xdt(["key", "ctrl+shift+i"])
             await asyncio.sleep(0.8)
             self._console_open = False
-            self._viewport_offset_cache = None  # Console changed viewport
+            self._viewport_offset_cache = None
+        await self._focus_main_window()
+
+    async def _focus_main_window(self):
+        """Focus the main browser window (not DevTools)."""
+        wid = self._main_wid
+        if not wid:
+            # Try to discover it now if not yet known
+            await self._find_main_window()
+            wid = self._main_wid
+        if not wid:
+            return
+        try:
+            await self._xdt(["windowactivate", "--sync", wid])
+            await asyncio.sleep(0.1)
+        except Exception:
+            pass
+
+    async def _find_main_window(self):
+        """Find the main Firefox browser window ID.
+
+        Searches for the Firefox window by PID or name. Called once after
+        Firefox starts to establish _main_wid for window management.
+        """
+        env = {**os.environ, "DISPLAY": self._display}
+        # Try by PID first (most reliable)
+        if self._firefox_proc and self._firefox_proc.pid:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "xdotool", "search", "--pid",
+                    str(self._firefox_proc.pid), "--name", "",
+                    env=env, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                out, _ = await proc.communicate()
+                for wid in out.decode().strip().split("\n"):
+                    wid = wid.strip()
+                    if wid:
+                        self._main_wid = wid
+                        logger.debug("Found main window by PID: %s", wid)
+                        return wid
+            except Exception:
+                pass
+        # Fallback: search by Firefox window name
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "xdotool", "search", "--name", "Mozilla Firefox",
+                env=env, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await proc.communicate()
+            for wid in out.decode().strip().split("\n"):
+                wid = wid.strip()
+                if wid:
+                    self._main_wid = wid
+                    logger.debug("Found main window by name: %s", wid)
+                    return wid
+        except Exception:
+            pass
+        logger.warning("Could not find main Firefox window ID")
+        return None
+
+    async def _find_devtools_window(self):
+        """Find the DevTools window ID (separate window mode).
+
+        Searches for windows with 'Developer Tools' in the title that
+        aren't the main browser window.
+        """
+        env = {**os.environ, "DISPLAY": self._display}
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "xdotool", "search", "--name", "Developer Tools",
+                env=env, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await proc.communicate()
+            for wid in out.decode().strip().split("\n"):
+                wid = wid.strip()
+                if wid and wid != self._main_wid:
+                    self._devtools_wid = wid
+                    logger.debug("Found DevTools window: %s", wid)
+                    return wid
+        except Exception:
+            pass
+        return None
+
+    async def _hide_devtools(self):
+        """Minimize DevTools window and focus main browser."""
+        if self._devtools_wid:
+            try:
+                await self._xdt(["windowminimize", self._devtools_wid])
+            except Exception:
+                pass
+        await self._focus_main_window()
+
+    async def _ensure_devtools_focused(self):
+        """Focus the DevTools window for JS input."""
+        if self._devtools_wid:
+            try:
+                await self._xdt(["windowactivate", "--sync",
+                                 self._devtools_wid])
+                await asyncio.sleep(0.15)
+                return True
+            except Exception:
+                pass
+        return False
 
     async def _sync_console_state(self):
         """Detect actual console state on first exec after daemon restart.
@@ -583,8 +720,13 @@ class NativeFirefoxSession:
             await asyncio.sleep(1.0)
             self._console_open = True
 
+        # In separate-window mode, find and track the DevTools window
+        if not self._devtools_wid:
+            await self._find_devtools_window()
+
         self._console_synced = True
-        logger.info("Console state synced: open=%s", self._console_open)
+        logger.info("Console state synced: open=%s, devtools_wid=%s",
+                     self._console_open, self._devtools_wid)
 
     def _get_best_fallback_offset(self):
         """Pick best fallback viewport offset based on current console state."""
@@ -778,24 +920,87 @@ async def _evaluate(session, params, timeout):
 
 
 async def _capture_screenshot(session, params, timeout):
-    """Page.captureScreenshot → Xvfb import command."""
+    """Page.captureScreenshot → Xvfb import command.
+
+    Captures only the main browser window (not root) to avoid focus changes
+    that would close fullscreen modals (e.g., Upwork's air3-modal).
+    """
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         tmp_path = tmp.name
 
     env = os.environ.copy()
     env["DISPLAY"] = session._display
 
-    # Close console for clean screenshot
-    await session._close_console()
-    await asyncio.sleep(0.2)
+    # Capture main window directly — avoids focus-changing _close_console()
+    # which triggers blur events and closes modals on sites like Upwork.
+    target_wid = session._main_wid
+
+    # Move DevTools off-screen before capture to prevent it bleeding through.
+    # windowmove doesn't change focus — safe for modal pages like Upwork.
+    devtools_orig_pos = None
+    if target_wid and session._devtools_wid:
+        try:
+            p = await asyncio.create_subprocess_exec(
+                "xdotool", "getwindowgeometry", "--shell",
+                session._devtools_wid,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await p.communicate()
+            geo = {}
+            for line in out.decode().strip().split("\n"):
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    geo[k] = v
+            devtools_orig_pos = (geo.get("X", "0"), geo.get("Y", "0"))
+            # Move off-screen (far right)
+            p = await asyncio.create_subprocess_exec(
+                "xdotool", "windowmove", session._devtools_wid,
+                "10000", "0",
+                env=env,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await p.wait()
+            await asyncio.sleep(0.05)
+        except Exception:
+            devtools_orig_pos = None
+
+    if target_wid:
+        import_args = [
+            "import", "-window", target_wid,
+            "-display", session._display, tmp_path,
+        ]
+    else:
+        # Fallback: capture root (old behavior) if main WID unknown
+        await session._close_console()
+        await asyncio.sleep(0.2)
+        import_args = [
+            "import", "-window", "root",
+            "-display", session._display, tmp_path,
+        ]
 
     proc = await asyncio.create_subprocess_exec(
-        "import", "-window", "root", "-display", session._display, tmp_path,
-        env=env,
+        *import_args, env=env,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
     await proc.wait()
+
+    # Move DevTools back to original position (no focus change)
+    if devtools_orig_pos and session._devtools_wid:
+        try:
+            p = await asyncio.create_subprocess_exec(
+                "xdotool", "windowmove", session._devtools_wid,
+                devtools_orig_pos[0], devtools_orig_pos[1],
+                env=env,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await p.wait()
+        except Exception:
+            pass
 
     data = ""
     try:
@@ -845,7 +1050,10 @@ async def _get_cookies(session, params, timeout):
         "  return {name: p[0], value: p.slice(1).join('='),"
         "          domain: location.hostname};"
         "})", timeout=timeout)
-    return {"cookies": result or []}
+    # Validate result is a list — JS timeout returns error string
+    if not isinstance(result, list):
+        return {"cookies": []}
+    return {"cookies": result}
 
 
 async def _set_cookie(session, params, timeout):

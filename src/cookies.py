@@ -69,6 +69,9 @@ class CookieCommands:
     async def save(self, filepath):
         """Save all cookies to a JSON file with restrictive permissions."""
         cookies = await self.get_all()
+        # Guard: if get_all returned non-list (e.g. error string), skip save
+        if not isinstance(cookies, list):
+            return 0
 
         def _write():
             os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
@@ -91,6 +94,8 @@ class CookieCommands:
         cookies = await asyncio.to_thread(_read)
         if cookies is None:
             return 0
+        if not isinstance(cookies, list):
+            return 0  # Corrupted file (e.g. error string was saved)
         if not cookies:
             return 0  # Empty list - file exists but no cookies
 

@@ -101,9 +101,11 @@ class Daemon:
         self._last_activity = time.time()
         logger.info("Browser started (%s)", self._browser_type)
 
-        # Capture main window ID for popup detection
+        # Capture main window ID for popup detection and DevTools management
         try:
             self._main_wid = await _get_browser_wid(self.pilot._session)
+            # Also set on session so it can focus main window from _close_console
+            self.pilot._session._main_wid = self._main_wid
             logger.info("Main browser WID: %s", self._main_wid)
         except Exception as e:
             logger.warning("Could not detect main WID: %s", e)
@@ -232,6 +234,14 @@ class Daemon:
                 if proc and proc.returncode is not None:
                     logger.error("Browser process died (rc=%d), shutting down daemon",
                                  proc.returncode)
+                    await self.shutdown()
+                    return
+            # Also check Firefox process directly via session
+            if self.pilot and hasattr(self.pilot, "_session"):
+                ff = getattr(self.pilot._session, "_firefox_proc", None)
+                if ff and ff.returncode is not None:
+                    logger.error("Firefox process died (rc=%d), shutting down daemon",
+                                 ff.returncode)
                     await self.shutdown()
                     return
 
@@ -389,8 +399,50 @@ async def _handle_click(daemon, params):
                 f"then verify the screenshot before clicking."
             )
 
+    # For selector-based left clicks, try JS .click() first — avoids
+    # console focus issues that cause xdotool clicks to miss the target.
+    # Falls back to coordinate-based xdotool click if JS click fails.
+    js_clicked = False
+    if target and button == "left" and not human and not use_xdotool:
+        js_ok = getattr(daemon.pilot._session, '_js_available', True)
+        if js_ok:
+            try:
+                from ._utils import escape_js_string
+                safe = escape_js_string(target)
+                # Use deep query to pierce shadow DOM (same as _get_element_center)
+                click_js = (
+                    "(function(){"
+                    "function __tbp_dq(root,sel){"
+                    "var el=root.querySelector(sel);if(el)return el;"
+                    "var all=root.querySelectorAll('*');"
+                    "for(var i=0;i<all.length;i++){"
+                    "if(all[i].shadowRoot){"
+                    "var found=__tbp_dq(all[i].shadowRoot,sel);"
+                    "if(found)return found}}return null}"
+                    "var el=__tbp_dq(document,'" + safe + "');"
+                    "if(!el)return null;"
+                    "el.scrollIntoView({block:'center',behavior:'instant'});"
+                    "el.click();return true})()"
+                )
+                result_val = await daemon.pilot.evaluate(click_js)
+                if result_val:
+                    js_clicked = True
+                    # Fire additional clicks for count > 1
+                    for _ in range(count - 1):
+                        await asyncio.sleep(interval)
+                        await daemon.pilot.evaluate(click_js)
+                    # After JS click, refocus main window so subsequent
+                    # interactions land on the page, not DevTools
+                    session = daemon.pilot._session
+                    await session._focus_main_window()
+                    session._page_has_focus = True
+            except Exception:
+                pass  # Fall through to coordinate-based click
+
     try:
-        if use_xdotool:
+        if js_clicked:
+            pass  # Already clicked via JS above
+        elif use_xdotool:
             session = daemon.pilot._session
             btn_map = {"left": "1", "middle": "2", "right": "3"}
             btn_num = btn_map.get(button, "1")
@@ -407,7 +459,9 @@ async def _handle_click(daemon, params):
                 out, _ = await proc.communicate()
                 active_wid = out.decode().strip()
                 if active_wid and active_wid != daemon._main_wid:
-                    popup_wid = active_wid
+                    # Skip DevTools window — it's not a popup
+                    if active_wid != getattr(session, '_devtools_wid', None):
+                        popup_wid = active_wid
             except Exception:
                 pass
             click_args = ["click"]
@@ -426,7 +480,8 @@ async def _handle_click(daemon, params):
                 selector=target, x=x, y=y, button=button, count=count,
                 interval=interval,
             )
-        result = {"clicked": target or f"({x},{y})", "method": "mouse"}
+        method = "js_click" if js_clicked else "mouse"
+        result = {"clicked": target or f"({x},{y})", "method": method}
         # Report what element was actually clicked (skip for right-click —
         # Firefox context menu blocks JS execution; skip on CSP pages
         # where JS doesn't work to avoid long timeouts)
@@ -538,8 +593,9 @@ async def _mouse_screenshot(daemon, cx, cy, path=None):
         path = validate_path("cursor_preview.png")
     else:
         path = validate_path(path)
+    session = daemon.pilot._session
     try:
-        await daemon.pilot._session._dismiss_popup()
+        await session._dismiss_popup()
     except Exception:
         pass
     await daemon.pilot.screenshot(path, full_page=False)
@@ -553,12 +609,18 @@ async def _handle_mouse_move(daemon, params):
     if x is None or y is None:
         raise ValueError("Missing x/y coordinates")
     session = daemon.pilot._session
-    # Close console so mouse lands on page, not DevTools
+    # Focus main browser window so mouse lands on page, not DevTools.
+    # In separate-window mode this just activates the main window (no
+    # viewport resize). Falls back to _close_console for docked mode.
     try:
-        await session._close_console()
+        if session._devtools_wid:
+            await session._focus_main_window()
+        else:
+            await session._close_console()
     except Exception:
         pass
     await asyncio.sleep(0.15)
+    session._page_has_focus = True  # Track that page now has focus
     # Screenshots are full-screen captures (include browser chrome),
     # so image coordinates ARE screen coordinates — no conversion needed.
     ix, iy = int(x), int(y)
@@ -571,12 +633,16 @@ async def _handle_mouse_move(daemon, params):
 
 async def _handle_mouse_locate(daemon, params):
     session = daemon.pilot._session
-    # Close console so we read actual page mouse position
+    # Focus main window so we read actual page mouse position
     try:
-        await session._close_console()
+        if session._devtools_wid:
+            await session._focus_main_window()
+        else:
+            await session._close_console()
     except Exception:
         pass
     await asyncio.sleep(0.15)
+    session._page_has_focus = True
     # Get current mouse position via xdotool (screen coords = image coords)
     env = {**os.environ, "DISPLAY": session._display}
     proc = await asyncio.create_subprocess_exec(
@@ -648,9 +714,10 @@ async def _handle_screenshot(daemon, params):
     path = validate_path(params.get("path", "screenshot.png"))
     full = params.get("full", False)
     cursor = params.get("cursor", False)
+    session = daemon.pilot._session
     # Dismiss Firefox chrome popups (save password/address) for clean screenshot
     try:
-        await daemon.pilot._session._dismiss_popup()
+        await session._dismiss_popup()
     except Exception:
         pass
     await daemon.pilot.screenshot(path, full_page=full)
@@ -806,6 +873,150 @@ async def _handle_find(daemon, params):
     if isinstance(results, list) and limit:
         results = results[:limit]
     return {"elements": results or []}
+
+
+async def _handle_elements(daemon, params):
+    """List interactive page elements by kind."""
+    kind = params.get("kind", "")
+    if not kind:
+        raise ValueError("Missing 'kind' parameter")
+    limit = params.get("limit", 50)
+
+    valid_kinds = ("links", "buttons", "inputs", "forms",
+                   "headings", "selects", "images")
+    if kind not in valid_kinds:
+        raise ValueError(
+            f"Invalid kind '{kind}'. Must be one of: {', '.join(valid_kinds)}"
+        )
+
+    # Shared selector-builder JS (reused across kinds)
+    sel_js = (
+        "function S(el){"
+        "if(el.id)return'#'+CSS.escape(el.id);"
+        "var p=[];var c=el;"
+        "while(c&&c!==document.body){"
+        "var s=c.tagName.toLowerCase();"
+        "if(c.id){p.unshift('#'+CSS.escape(c.id));break}"
+        "var idx=1;var sb=c.previousElementSibling;"
+        "while(sb){if(sb.tagName===c.tagName)idx++;sb=sb.previousElementSibling}"
+        "var cnt=0;var ch=c.parentElement?c.parentElement.children:[];"
+        "for(var j=0;j<ch.length;j++){if(ch[j].tagName===c.tagName)cnt++}"
+        "if(cnt>1)s+=':nth-of-type('+idx+')';"
+        "p.unshift(s);c=c.parentElement}"
+        "return p.join(' > ')}"
+    )
+
+    kind_js = {
+        "links": (
+            "var els=Array.from(document.querySelectorAll('a'));"
+            "var r=[];"
+            "for(var i=0;i<els.length&&r.length<LIM;i++){"
+            "var el=els[i];"
+            "if(el.offsetParent===null&&el.offsetWidth===0)continue;"
+            "r.push({text:(el.innerText||'').trim().substring(0,80),"
+            "href:el.href||'',selector:S(el)})}"
+            "return r"
+        ),
+        "buttons": (
+            "var els=Array.from(document.querySelectorAll("
+            "'button,input[type=submit],input[type=button],[role=button]'));"
+            "var r=[];"
+            "for(var i=0;i<els.length&&r.length<LIM;i++){"
+            "var el=els[i];"
+            "if(el.offsetParent===null&&el.offsetWidth===0)continue;"
+            "var txt=(el.innerText||el.value||el.getAttribute('aria-label')||'').trim();"
+            "r.push({text:txt.substring(0,80),"
+            "type:el.type||el.tagName.toLowerCase(),"
+            "selector:S(el),disabled:!!el.disabled})}"
+            "return r"
+        ),
+        "inputs": (
+            "var els=Array.from(document.querySelectorAll("
+            "'input,textarea,select'));"
+            "var skip=['hidden','submit','button'];"
+            "var r=[];"
+            "for(var i=0;i<els.length&&r.length<LIM;i++){"
+            "var el=els[i];"
+            "var t=(el.type||'text').toLowerCase();"
+            "if(skip.indexOf(t)!==-1)continue;"
+            "if(el.offsetParent===null&&el.offsetWidth===0)continue;"
+            "var lbl='';"
+            "if(el.id){var lb=document.querySelector('label[for=\"'+CSS.escape(el.id)+'\"]');"
+            "if(lb)lbl=lb.innerText.trim()}"
+            "if(!lbl&&el.closest('label'))lbl=el.closest('label').innerText.trim();"
+            "r.push({type:t,name:el.name||'',"
+            "placeholder:el.placeholder||'',"
+            "value:(el.value||'').substring(0,50),"
+            "selector:S(el),label:lbl.substring(0,80)})}"
+            "return r"
+        ),
+        "forms": (
+            "var els=Array.from(document.querySelectorAll('form'));"
+            "var r=[];"
+            "for(var i=0;i<els.length&&r.length<LIM;i++){"
+            "var el=els[i];"
+            "var fields=[];"
+            "var inputs=el.querySelectorAll('input,textarea,select');"
+            "for(var j=0;j<inputs.length&&j<20;j++){"
+            "var inp=inputs[j];"
+            "fields.push({name:inp.name||'',type:(inp.type||'text').toLowerCase(),"
+            "placeholder:inp.placeholder||''})}"
+            "r.push({action:el.action||'',method:(el.method||'get').toUpperCase(),"
+            "id:el.id||'',fields:fields})}"
+            "return r"
+        ),
+        "headings": (
+            "var els=Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6'));"
+            "var r=[];"
+            "for(var i=0;i<els.length&&r.length<LIM;i++){"
+            "var el=els[i];"
+            "if(el.offsetParent===null&&el.offsetWidth===0)continue;"
+            "r.push({level:parseInt(el.tagName[1]),"
+            "text:(el.innerText||'').trim().substring(0,100),"
+            "selector:S(el)})}"
+            "return r"
+        ),
+        "selects": (
+            "var els=Array.from(document.querySelectorAll("
+            "'select,[role=combobox],[role=listbox]'));"
+            "var r=[];"
+            "for(var i=0;i<els.length&&r.length<LIM;i++){"
+            "var el=els[i];"
+            "if(el.offsetParent===null&&el.offsetWidth===0)continue;"
+            "var opts=[];"
+            "if(el.options){"
+            "for(var j=0;j<el.options.length&&j<30;j++){"
+            "opts.push({value:el.options[j].value,"
+            "text:el.options[j].text.trim().substring(0,60),"
+            "selected:el.options[j].selected})}}"
+            "r.push({selector:S(el),name:el.name||'',"
+            "options:opts,multiple:!!el.multiple})}"
+            "return r"
+        ),
+        "images": (
+            "var els=Array.from(document.querySelectorAll('img'));"
+            "var r=[];"
+            "for(var i=0;i<els.length&&r.length<LIM;i++){"
+            "var el=els[i];"
+            "if(el.offsetParent===null&&el.offsetWidth===0)continue;"
+            "r.push({src:el.src||'',alt:el.alt||'',"
+            "width:el.naturalWidth||el.width,"
+            "height:el.naturalHeight||el.height,"
+            "selector:S(el)})}"
+            "return r"
+        ),
+    }
+
+    js = (
+        "(function(){"
+        + sel_js
+        + "var LIM=" + str(int(limit)) + ";"
+        + kind_js[kind]
+        + "})()"
+    )
+
+    results = await daemon.pilot.evaluate(js)
+    return {"kind": kind, "elements": results or []}
 
 
 async def _handle_shutdown(daemon, params):
@@ -4935,6 +5146,7 @@ _HANDLERS = {
     "cookies": _handle_cookies,
     "a11y": _handle_a11y,
     "find": _handle_find,
+    "elements": _handle_elements,
     "tab_new": _handle_tab_new,
     "tab_close": _handle_tab_close,
     "tab_next": _handle_tab_next,

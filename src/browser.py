@@ -97,6 +97,7 @@ class BrowserPilot:
         self._proxy = proxy  # Proxy URL for Chromium --proxy-server flag
         self._virgl = None
         self._xvfb_proc = None
+        self._wm_proc = None  # Window manager (openbox)
         self._chrome_proc = None
         self._ws_url = None
         self._user_data_dir = None
@@ -184,6 +185,32 @@ class BrowserPilot:
         )
         os.environ["DISPLAY"] = self.display
         await asyncio.sleep(0.5)
+
+        # Start a lightweight window manager (required for window
+        # minimize/activate/raise operations used by DevTools management).
+        # Kill any existing openbox first.
+        proc = await asyncio.create_subprocess_exec(
+            "pkill", "-f", f"openbox.*{self.display}",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        env = os.environ.copy()
+        env["DISPLAY"] = self.display
+        openbox_bin = shutil.which("openbox")
+        if openbox_bin:
+            self._wm_proc = await asyncio.create_subprocess_exec(
+                openbox_bin,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                env=env,
+            )
+            await asyncio.sleep(0.3)
+            logger.info("Window manager started (openbox, PID %d)",
+                        self._wm_proc.pid)
+        else:
+            self._wm_proc = None
+            logger.warning("openbox not found — window management may not work")
 
         if self._xvfb_proc.returncode is not None:
             raise RuntimeError("Xvfb failed to start")
@@ -335,7 +362,7 @@ class BrowserPilot:
         Uses SIGTERM first, gives processes time to flush state, then SIGKILL.
         Cleans up temporary user-data-dir afterward.
         """
-        for proc in (self._chrome_proc, self._xvfb_proc):
+        for proc in (self._chrome_proc, self._wm_proc, self._xvfb_proc):
             if proc and proc.returncode is None:
                 try:
                     proc.terminate()
@@ -346,6 +373,7 @@ class BrowserPilot:
                 except Exception as e:
                     logger.warning("Error stopping process: %s", e)
         self._chrome_proc = None
+        self._wm_proc = None
         self._xvfb_proc = None
 
         # Stop virgl server
