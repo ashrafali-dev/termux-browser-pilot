@@ -17,11 +17,15 @@ from .lock import SessionLock
 # Optional: Chromium-only modules (require websockets)
 try:
     from .cdp import CDPSession
-    from .cloudflare import CloudflareHandler
-    from .network import NetworkTracker
 except ImportError:
     CDPSession = None
+try:
+    from .cloudflare import CloudflareHandler
+except ImportError:
     CloudflareHandler = None
+try:
+    from .network import NetworkTracker
+except ImportError:
     NetworkTracker = None
 
 logger = logging.getLogger(__name__)
