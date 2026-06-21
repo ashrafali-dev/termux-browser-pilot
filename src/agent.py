@@ -192,6 +192,9 @@ async def run_step(client, tool_schemas, name_to_fn, goal, input_data=None,
         {"role": "user", "content": user_intro},
     ]
 
+    MAX_MALFORMED_RETRIES = 3
+    malformed_retries = 0
+
     for step in range(1, max_steps + 1):
         try:
             resp = client.chat.completions.create(
@@ -203,6 +206,28 @@ async def run_step(client, tool_schemas, name_to_fn, goal, input_data=None,
                 max_tokens=800,
             )
         except Exception as e:
+            # Groq sometimes generates a malformed tool call (bad JSON in
+            # arguments) and rejects it server-side with a 400 before we
+            # ever see a normal response. This is a model slip, not a fatal
+            # error — nudge the model to retry instead of failing the step,
+            # but only up to a few times so a persistently broken model
+            # doesn't loop forever.
+            err_str = str(e)
+            is_malformed_tool_call = (
+                "tool_use_failed" in err_str or "Failed to parse tool call" in err_str
+            )
+            if is_malformed_tool_call and malformed_retries < MAX_MALFORMED_RETRIES:
+                malformed_retries += 1
+                if verbose:
+                    print(f"    -> malformed tool call from model, retrying "
+                          f"({malformed_retries}/{MAX_MALFORMED_RETRIES})")
+                messages.append({"role": "user", "content": (
+                    "Your last tool call had invalid JSON arguments and was "
+                    "rejected. Try again with valid, properly formatted "
+                    "arguments matching the tool's parameter schema."
+                )})
+                continue
+
             if verbose:
                 print(f"    -> Groq API error: {type(e).__name__}: {e}")
             return {"status": "fail", "reason": f"LLM call error: {e}", "steps": step}
